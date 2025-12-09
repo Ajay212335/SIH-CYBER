@@ -38,7 +38,6 @@ import tldextract
 import ipaddress
 from pymongo import MongoClient
 import random
-from twilio.rest import Client
 import bcrypt
 import base64
 import mimetypes
