@@ -1,9 +1,7 @@
-
 scikit-learn==1.6.1
 gunicorn
 flask
 flask-cors
-bson
 werkzeug
 pandas
 requests
@@ -25,4 +23,3 @@ twilio
 bcrypt
 python-dotenv
 cryptography
-
