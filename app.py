@@ -3,7 +3,7 @@ from flask_cors import CORS
 from bson.objectid import ObjectId
 from bson.json_util import dumps
 from werkzeug.utils import secure_filename
-from datetime import datetime
+
 import os
 import tempfile
 import json
@@ -40,38 +40,42 @@ from pymongo import MongoClient
 import random
 from twilio.rest import Client
 import bcrypt
-
-# NEW: Crypto imports for RSA + AES hybrid encryption
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP, AES
-from Crypto.Random import get_random_bytes
 import base64
+import mimetypes
+from dotenv import load_dotenv
+load_dotenv()
+from datetime import datetime, timezone
+
+# --- CRYPTO IMPORTS -----------------------------------------------------
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
 
 # -------------------------------------------------------------------
 # FLASK & BASIC CONFIG
 # -------------------------------------------------------------------
 app = Flask(__name__)
 
-# Secret key for sessions
+# Secret key for sessions (MUST come from env on Render)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "super-secret-dev-key")
 
-# Allow cookies (sessions) from frontend origins
+# FRONTEND_ORIGINS can be comma-separated list in env
+frontend_origins_env = os.environ.get(
+    "FRONTEND_ORIGINS",
+    "http://localhost:5173,http://localhost:5174,http://localhost:3000"
+)
+FRONTEND_ORIGINS = [o.strip() for o in frontend_origins_env.split(",") if o.strip()]
+
 CORS(
     app,
-    origins=[
-        "http://localhost:5173",
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://localhost:8081",
-        "exp://*",  # Expo mobile (safe)
-        "*",
-    ],
+    origins=FRONTEND_ORIGINS,
     supports_credentials=True,
 )
 
-# For local dev you can keep Secure=False; for HTTPS set True
+# For Render (HTTPS), you can later set this to True via env if needed
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = False
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "0") == "1"
 
 app.config["UPLOAD_FOLDER"] = "uploads"  # for evidence files
 app.config["COMPLAINTS_FOLDER"] = "complaints_data"
@@ -86,36 +90,34 @@ os.makedirs(uploads_abs, exist_ok=True)
 os.makedirs(reports_abs, exist_ok=True)
 
 # -------------------------------------------------------------------
-# SECRETS / API KEYS
+# SECRETS / API KEYS (ALL FROM ENV ON RENDER)
 # -------------------------------------------------------------------
-# ⚠️ In real deployments, move these to environment variables.
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "gpt-4"  # used for the legal acts AI, others override with gpt-3.5 / gpt-4o-mini
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "gpt-4")
 
+TWOFACTOR_API_KEY = os.environ.get("TWOFACTOR_API_KEY", "")
 
-TWOFACTOR_API_KEY = os.environ.get("TWOFACTOR_API_KEY", "4abfd1b6-d4b2-11f0-a6b2-0200cd936042")
+HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY", "")
+API_URL = "https://api-inference.huggingface.co/models/dima806/deepfake_vs_real_image_detection"
 
 # -------------------------------------------------------------------
 # MONGO SETUP
 # -------------------------------------------------------------------
-MONGO_URI = "mongodb://localhost:27017/"
-MONGO_DB_NAME = "cybersecurity_portal"
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "cybersecurity_portal")
 MONGO_COLLECTION_NAME = "complaints"
 MONGO_VOLUNTEERS_COLLECTION_NAME = "volunteers"
 
 try:
     mongo_client = MongoClient(MONGO_URI)
     mongo_db = mongo_client[MONGO_DB_NAME]
-
-    complaints_collection = mongo_db["complaints"]
-    volunteers_collection = mongo_db["volunteers"]
+    complaints_collection = mongo_db[MONGO_COLLECTION_NAME]
+    volunteers_collection = mongo_db[MONGO_VOLUNTEERS_COLLECTION_NAME]
     admin_collection = mongo_db["admin"]
     team_members_collection = mongo_db["team_members"]
-
-    # NEW COLLECTION FOR CITIZEN LOGIN
-    user_collection = mongo_db["users"]
-
+    users_collection = mongo_db["users"]
+    rsa_keys_collection = mongo_db["rsa_keys"]
     print(f"✅ MongoDB connected to database: {MONGO_DB_NAME}")
 except Exception as e:
     print(f"❌ Error connecting to MongoDB: {e}")
@@ -124,11 +126,19 @@ except Exception as e:
     volunteers_collection = None
     admin_collection = None
     team_members_collection = None
+    users_collection = None
+    rsa_keys_collection = None
 
 # -------------------------------------------------------------------
 # BASIC UTILS
 # -------------------------------------------------------------------
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# On Render, tesseract path might be different or not installed.
+# Keep this safe by checking path existence.
+tesseract_default_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(tesseract_default_path):
+    pytesseract.pytesseract.tesseract_cmd = tesseract_default_path
+# else: rely on default PATH on Linux container
+
 
 
 def generate_complaint_id():
@@ -161,93 +171,222 @@ def get_admin_from_request():
 
 
 # -------------------------------------------------------------------
-# RSA + AES HYBRID ENCRYPTION HELPERS
+# HYBRID RSA + AES-GCM CRYPTO HELPERS
 # -------------------------------------------------------------------
-RSA_PRIVATE_KEY = None
-RSA_PUBLIC_KEY = None
+RSA_KEY_SIZE = 2048
+RSA_KEY_NAME = "server_default_rsa_key"  # single server-side keypair
 
 
-def init_rsa_keys():
-    """Generate/load RSA keypair once for the server."""
-    global RSA_PRIVATE_KEY, RSA_PUBLIC_KEY
-    priv_path = os.path.join(app.root_path, "rsa_private.pem")
-    pub_path = os.path.join(app.root_path, "rsa_public.pem")
-
-    if os.path.exists(priv_path) and os.path.exists(pub_path):
-        with open(priv_path, "rb") as f:
-            RSA_PRIVATE_KEY = RSA.import_key(f.read())
-        with open(pub_path, "rb") as f:
-            RSA_PUBLIC_KEY = RSA.import_key(f.read())
-        print("✅ Loaded existing RSA keypair")
-    else:
-        key = RSA.generate(2048)
-        RSA_PRIVATE_KEY = key
-        RSA_PUBLIC_KEY = key.publickey()
-        with open(priv_path, "wb") as f:
-            f.write(RSA_PRIVATE_KEY.export_key("PEM"))
-        with open(pub_path, "wb") as f:
-            f.write(RSA_PUBLIC_KEY.export_key("PEM"))
-        print("✅ Generated new RSA keypair")
+def _generate_rsa_keypair():
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=RSA_KEY_SIZE,
+        backend=default_backend(),
+    )
+    public_key = private_key.public_key()
+    return private_key, public_key
 
 
-def encrypt_text(plaintext: str) -> str:
+def _serialize_private_key(private_key):
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),  # ⚠️ dev only
+    ).decode("utf-8")
+
+
+def _serialize_public_key(public_key):
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
+
+def _load_private_key(pem_str):
+    return serialization.load_pem_private_key(
+        pem_str.encode("utf-8"),
+        password=None,
+        backend=default_backend(),
+    )
+
+
+def _load_public_key(pem_str):
+    return serialization.load_pem_public_key(
+        pem_str.encode("utf-8"),
+        backend=default_backend(),
+    )
+
+
+def get_or_create_server_rsa_keypair():
     """
-    Encrypt a long text using AES-GCM + RSA (hybrid).
-    Returns a JSON string with base64-encoded components.
+    Load or generate and persist RSA keypair in the 'rsa_keys' collection.
     """
-    if not plaintext:
-        return ""
+    global rsa_keys_collection
 
-    data = plaintext.encode("utf-8")
+    if rsa_keys_collection is None:
+        # Fallback: return an in-memory keypair (not persisted)
+        return _generate_rsa_keypair()
 
-    # 1) Random AES key
-    aes_key = get_random_bytes(32)  # 256-bit
+    doc = rsa_keys_collection.find_one({"key_name": RSA_KEY_NAME})
+    if doc:
+        try:
+            private_key = _load_private_key(doc["private_key_pem"])
+            public_key = _load_public_key(doc["public_key_pem"])
+            return private_key, public_key
+        except Exception as e:
+            print(f"❌ Failed to load RSA key from DB, regenerating: {e}")
 
-    # 2) AES-GCM encrypt
-    cipher_aes = AES.new(aes_key, AES.MODE_GCM)
-    ciphertext, tag = cipher_aes.encrypt_and_digest(data)
+    # create new
+    private_key, public_key = _generate_rsa_keypair()
+    rsa_keys_collection.update_one(
+        {"key_name": RSA_KEY_NAME},
+        {
+            "$set": {
+                "key_name": RSA_KEY_NAME,
+                "private_key_pem": _serialize_private_key(private_key),
+                "public_key_pem": _serialize_public_key(public_key),
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
+    )
+    print("✅ RSA keypair generated and stored in MongoDB (rsa_keys collection).")
+    return private_key, public_key
 
-    # 3) Encrypt AES key with RSA public key
-    cipher_rsa = PKCS1_OAEP.new(RSA_PUBLIC_KEY)
-    enc_key = cipher_rsa.encrypt(aes_key)
 
-    payload = {
-        "k": base64.b64encode(enc_key).decode("utf-8"),
-        "n": base64.b64encode(cipher_aes.nonce).decode("utf-8"),
-        "t": base64.b64encode(tag).decode("utf-8"),
-        "c": base64.b64encode(ciphertext).decode("utf-8"),
-    }
-    return json.dumps(payload)
+# Helper: RSA-OAEP encrypt small blobs (bytes) -> bytes
+def _rsa_encrypt_bytes(plaintext_bytes: bytes, public_key) -> bytes:
+    return public_key.encrypt(
+        plaintext_bytes,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
 
 
-def decrypt_text(encrypted: str) -> str:
+# Helper: RSA-OAEP decrypt bytes -> plaintext bytes
+def _rsa_decrypt_bytes(cipher_bytes: bytes, private_key) -> bytes:
+    return private_key.decrypt(
+        cipher_bytes,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+
+# Estimate RSA maximum plaintext bytes for OAEP/SHA256
+def _rsa_max_plaintext_bytes():
+    # For RSA OAEP with SHA-256: max = key_bytes - 2*hash_len - 2
+    key_bytes = RSA_KEY_SIZE // 8
+    hash_len = hashes.SHA256().digest_size
+    return key_bytes - 2 * hash_len - 2
+
+
+def rsa_encrypt_text(plaintext: str) -> str:
     """
-    Decrypt text previously encrypted with encrypt_text().
-    Gracefully falls back (returns original) if it’s not valid JSON/encrypted.
+    Hybrid encrypt a Unicode string and return a JSON string (safe to store in MongoDB).
+    Returned value is a JSON string with one of two formats:
+      - {"method":"rsa","ciphertext_b64": "..."}          -> RSA-only (small payload)
+      - {"method":"hybrid","encrypted_key_b64":"...","nonce_b64":"...","ciphertext_b64":"..."}
+
+    Used for user_info, scenario, additional_info and other sensitive strings.
     """
-    if not encrypted:
-        return ""
+    if plaintext is None:
+        return None
+
+    # get RSA public key
+    _, public_key = get_or_create_server_rsa_keypair()
+    plaintext_bytes = plaintext.encode("utf-8")
 
     try:
-        payload = json.loads(encrypted)
-        enc_key = base64.b64decode(payload["k"])
-        nonce = base64.b64decode(payload["n"])
-        tag = base64.b64decode(payload["t"])
-        ciphertext = base64.b64decode(payload["c"])
+        max_bytes = _rsa_max_plaintext_bytes()
+        if len(plaintext_bytes) <= max_bytes:
+            # small: encrypt directly with RSA-OAEP
+            ct = _rsa_encrypt_bytes(plaintext_bytes, public_key)
+            out = {"method": "rsa", "ciphertext_b64": base64.b64encode(ct).decode("utf-8")}
+            return json.dumps(out)
+        else:
+            # large: AES-GCM (generate random 32-byte key) + RSA encrypt the AES key
+            aes_key = AESGCM.generate_key(bit_length=256)  # 32 bytes
+            aesgcm = AESGCM(aes_key)
+            nonce = os.urandom(12)  # 96-bit nonce recommended for AES-GCM
+            ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, associated_data=None)
 
-        cipher_rsa = PKCS1_OAEP.new(RSA_PRIVATE_KEY)
-        aes_key = cipher_rsa.decrypt(enc_key)
+            # encrypt the AES key with RSA-OAEP
+            enc_key = _rsa_encrypt_bytes(aes_key, public_key)
 
-        cipher_aes = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
-        data = cipher_aes.decrypt_and_verify(ciphertext, tag)
-        return data.decode("utf-8")
+            out = {
+                "method": "hybrid",
+                "encrypted_key_b64": base64.b64encode(enc_key).decode("utf-8"),
+                "nonce_b64": base64.b64encode(nonce).decode("utf-8"),
+                "ciphertext_b64": base64.b64encode(ciphertext).decode("utf-8"),
+            }
+            return json.dumps(out)
     except Exception as e:
-        # For old records or unexpected format, just return as-is
-        print("[DECRYPT] Failed or plain text detected:", e)
-        return encrypted
+        # bubble up a clear error for logging
+        raise Exception(f"Encryption failed: {str(e)}")
 
 
-init_rsa_keys()
+def rsa_decrypt_text(ciphertext_blob: str) -> str:
+    """
+    Decrypt a JSON string produced by rsa_encrypt_text and return the original plaintext.
+    Accepts the two JSON formats specified in rsa_encrypt_text.
+    """
+    if ciphertext_blob is None:
+        return None
+
+    # parse JSON (it was stored as a JSON string)
+    try:
+        obj = json.loads(ciphertext_blob)
+    except Exception:
+        # If parsing fails, maybe older code stored raw base64 RSA ciphertext (legacy)
+        try:
+            private_key, _ = get_or_create_server_rsa_keypair()
+            ct_bytes = base64.b64decode(ciphertext_blob.encode("utf-8"))
+            pt_bytes = _rsa_decrypt_bytes(ct_bytes, private_key)
+            return pt_bytes.decode("utf-8")
+        except Exception as e2:
+            raise Exception(f"Decryption failed (not JSON, legacy path failed): {e2}")
+
+    method = obj.get("method")
+    private_key, _ = get_or_create_server_rsa_keypair()
+
+    try:
+        if method == "rsa":
+            ct_b64 = obj.get("ciphertext_b64")
+            if not ct_b64:
+                return None
+            ct_bytes = base64.b64decode(ct_b64.encode("utf-8"))
+            pt_bytes = _rsa_decrypt_bytes(ct_bytes, private_key)
+            return pt_bytes.decode("utf-8")
+
+        elif method == "hybrid":
+            enc_key_b64 = obj.get("encrypted_key_b64")
+            nonce_b64 = obj.get("nonce_b64")
+            ct_b64 = obj.get("ciphertext_b64")
+            if not enc_key_b64 or not nonce_b64 or not ct_b64:
+                raise Exception("Missing hybrid fields")
+
+            enc_key = base64.b64decode(enc_key_b64.encode("utf-8"))
+            nonce = base64.b64decode(nonce_b64.encode("utf-8"))
+            ciphertext = base64.b64decode(ct_b64.encode("utf-8"))
+
+            # decrypt AES key with RSA private key
+            aes_key = _rsa_decrypt_bytes(enc_key, private_key)
+
+            aesgcm = AESGCM(aes_key)
+            plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, associated_data=None)
+            return plaintext_bytes.decode("utf-8")
+        else:
+            raise Exception("Unknown encryption method")
+    except Exception as e:
+        raise Exception(f"Decryption failed: {str(e)}")
+
 
 # -------------------------------------------------------------------
 # LOAD ML MODELS
@@ -496,7 +635,7 @@ class MultiLibraryPhishingDetector:
             if not results["dns_records"].get("MX"):
                 results["reasons"].append("No MX (email) records found")
 
-        except Exception as e:
+        except Exception:
             results["is_suspicious"] = True
             results["reasons"].append("DNS resolution failed")
 
@@ -994,6 +1133,8 @@ detector = MultiLibraryPhishingDetector()
 def extract_features_for_ml(url, X_cols):
     """Placeholder for ML feature extraction."""
     features = {}
+    if not X_cols:
+        return pd.DataFrame([{}])
     for col in X_cols:
         if col not in features:
             features[col] = 0
@@ -1102,79 +1243,317 @@ def analyze_phishing_document(file_path, filename):
         return {"error": f"Document analysis failed: {str(e)}"}
 
 
-def analyze_deepfake_image(file_path):
-    if not deepfake_image_model:
-        return {"error": "Deepfake image model not loaded"}
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_DEEPFAKE_IMAGE_MODEL = os.getenv(
+    "HF_DEEPFAKE_IMAGE_MODEL",
+    "dima806/deepfake_vs_real_image_detection"  # image classifier
+)
+
+HF_DEEPFAKE_VIDEO_MODEL = os.getenv(
+    "HF_DEEPFAKE_VIDEO_MODEL",
+    "your-org/your-video-deepfake-model"  # TODO: set to actual video model name
+)
+
+HF_IMAGE_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_DEEPFAKE_IMAGE_MODEL}"
+HF_VIDEO_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_DEEPFAKE_VIDEO_MODEL}"
+
+
+def analyze_deepfake_image(image_path: str) -> dict:
+    """
+    Calls an image deepfake classifier on Hugging Face router.
+
+    Returns FLAT dict for React:
+    {
+      "prediction": "Fake" | "Real" | "Error",
+      "confidence": float,
+      "is_deepfake": bool,
+      "label": str,
+      "raw": HF_raw_response
+    }
+    """
+    if not HF_API_KEY:
+        return {
+            "error": "HF_API_KEY not configured in environment",
+            "prediction": "Error",
+            "confidence": 0.0,
+            "is_deepfake": False,
+            "label": "Unknown",
+        }
 
     try:
-        image = Image.open(file_path).convert("RGB")
-        image_processor = AutoImageProcessor.from_pretrained(
-            "dima806/deepfake_vs_real_image_detection"
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        headers = {
+            "Authorization": f"Bearer {HF_API_KEY}",
+            "Content-Type": "application/octet-stream",
+        }
+
+        resp = requests.post(
+            HF_IMAGE_API_URL,
+            headers=headers,
+            data=image_bytes,
+            timeout=60,
         )
-        inputs = image_processor(images=image, return_tensors="pt")
 
-        with torch.no_grad():
-            outputs = deepfake_image_model(**inputs)
-            logits = outputs.logits
-            probabilities = torch.softmax(logits, dim=1)
-            predicted_class_idx = torch.argmax(probabilities, dim=1).item()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            return {
+                "error": f"HuggingFace HTTP error: {e}",
+                "status_code": resp.status_code,
+                "raw": resp.text[:500],
+                "prediction": "Error",
+                "confidence": 0.0,
+                "is_deepfake": False,
+                "label": "Unknown",
+            }
 
-        predicted_label = deepfake_image_model.config.id2label[predicted_class_idx]
-        confidence = probabilities[0, predicted_class_idx].item()
+        try:
+            data = resp.json()
+        except ValueError:
+            return {
+                "error": "HuggingFace returned non-JSON response",
+                "raw": resp.text[:500],
+                "prediction": "Error",
+                "confidence": 0.0,
+                "is_deepfake": False,
+                "label": "Unknown",
+            }
+
+        # Expected: list of {label, score}
+        if isinstance(data, list) and data:
+            top = max(data, key=lambda x: x.get("score", 0.0))
+            label = str(top.get("label", "Unknown")).strip()
+            score = float(top.get("score", 0.0))
+        elif isinstance(data, dict) and "label" in data:
+            label = str(data.get("label", "Unknown")).strip()
+            score = float(data.get("score", 0.0))
+        else:
+            return {
+                "error": "Unexpected HF response format",
+                "raw": data,
+                "prediction": "Error",
+                "confidence": 0.0,
+                "is_deepfake": False,
+                "label": "Unknown",
+            }
+
+        is_fake = label.lower() in ["fake", "deepfake", "manipulated"]
 
         return {
-            "prediction": predicted_label,
-            "confidence": confidence,
-            "is_deepfake": predicted_label.lower() != "real",
+            "label": label,
+            "score": score,
+            "raw": data,
+            "prediction": "Fake" if is_fake else "Real",
+            "confidence": score,
+            "is_deepfake": is_fake,
         }
+
     except Exception as e:
-        return {"error": f"Image analysis failed: {str(e)}"}
-
-
-def analyze_deepfake_video(file_path):
-    if not deepfake_video_model:
-        return {"error": "Deepfake video model not loaded"}
-
-    NUM_FRAMES = 16
-    try:
-        cap = cv2.VideoCapture(file_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if total_frames < NUM_FRAMES:
-            return {"error": f"Video too short. Needs at least {NUM_FRAMES} frames"}
-
-        frames = []
-        frame_indices = np.linspace(0, total_frames - 1, NUM_FRAMES, dtype=np.int32)
-
-        for i in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = cap.read()
-            if ret:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        cap.release()
-
-        video_processor = AutoImageProcessor.from_pretrained(
-            "muneeb1812/videomae-base-fake-video-classification"
-        )
-        inputs = video_processor(images=frames, return_tensors="pt")
-
-        with torch.no_grad():
-            outputs = deepfake_video_model(**inputs)
-            logits = outputs.logits
-            probabilities = torch.softmax(logits, dim=1)
-            predicted_class_idx = torch.argmax(probabilities, dim=1).item()
-
-        predicted_label = deepfake_video_model.config.id2label[predicted_class_idx]
-        confidence = probabilities[0, predicted_class_idx].item()
-
         return {
-            "prediction": predicted_label,
-            "confidence": confidence,
-            "is_deepfake": predicted_label.lower() != "real",
+            "error": str(e),
+            "prediction": "Error",
+            "confidence": 0.0,
+            "is_deepfake": False,
+            "label": "Unknown",
         }
-    except Exception as e:
-        return {"error": f"Video analysis failed: {str(e)}"}
+
+
+# =================== HELPER: VIDEO DEEPFAKE ===================
+
+def analyze_deepfake_video(video_path: str, max_frames: int = 10) -> dict:
+    """
+    Analyze a video for deepfakes by:
+      - Sampling up to `max_frames` frames from the video
+      - Sending each frame to the SAME HuggingFace image deepfake model
+      - Aggregating frame predictions using THREAT-BASED LOGIC
+
+    Returns FLAT dict for React:
+    {
+      "prediction": "Fake" | "Real" | "Suspicious" | "Error",
+      "confidence": float,
+      "is_deepfake": bool,
+      "label": str,
+      "frames_analyzed": int,
+      "frame_results": [...]
+    }
+    """
+
+    if not HF_API_KEY:
+        return {
+            "error": "HF_API_KEY not configured in environment",
+            "prediction": "Error",
+            "confidence": 0.0,
+            "is_deepfake": False,
+            "label": "Unknown",
+            "frames_analyzed": 0,
+        }
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {
+            "error": "Unable to open video file",
+            "prediction": "Error",
+            "confidence": 0.0,
+            "is_deepfake": False,
+            "label": "Unknown",
+            "frames_analyzed": 0,
+        }
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if total_frames <= 0:
+        total_frames = max_frames
+
+    num_samples = min(max_frames, total_frames)
+    frame_indices = (
+        np.linspace(0, total_frames - 1, num_samples, dtype=int)
+        if total_frames > 0
+        else np.arange(num_samples)
+    )
+
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/octet-stream",
+    }
+
+    frame_results = []
+    fake_confidences = []
+    real_confidences = []
+
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
+
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            continue
+        image_bytes = buf.tobytes()
+
+        try:
+            resp = requests.post(
+                HF_IMAGE_API_URL,
+                headers=headers,
+                data=image_bytes,
+                timeout=60,
+            )
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            frame_results.append({
+                "frame_index": int(idx),
+                "error": f"HuggingFace HTTP error: {e}",
+                "status_code": resp.status_code if 'resp' in locals() else None,
+            })
+            continue
+        except Exception as e:
+            frame_results.append({
+                "frame_index": int(idx),
+                "error": str(e),
+            })
+            continue
+
+        try:
+            data = resp.json()
+        except ValueError:
+            frame_results.append({
+                "frame_index": int(idx),
+                "error": "HuggingFace returned non-JSON response",
+                "raw": resp.text[:300],
+            })
+            continue
+
+        label = "Unknown"
+        score = 0.0
+
+        if isinstance(data, list) and data:
+            top = max(data, key=lambda x: x.get("score", 0.0))
+            label = str(top.get("label", "Unknown")).strip()
+            score = float(top.get("score", 0.0))
+        elif isinstance(data, dict) and "label" in data:
+            label = str(data.get("label", "Unknown")).strip()
+            score = float(data.get("score", 0.0))
+        else:
+            frame_results.append({
+                "frame_index": int(idx),
+                "error": "Unexpected HF response format",
+                "raw": data,
+            })
+            continue
+
+        is_fake = label.lower() in ["fake", "deepfake", "manipulated"]
+
+        if is_fake:
+            fake_confidences.append(score)
+        else:
+            real_confidences.append(score)
+
+        frame_results.append({
+            "frame_index": int(idx),
+            "label": label,
+            "score": score,
+            "is_deepfake": is_fake,
+            "raw": data,
+        })
+
+    cap.release()
+
+    valid_frames = [fr for fr in frame_results if "label" in fr]
+    if not valid_frames:
+        return {
+            "error": "No valid frames could be analyzed",
+            "prediction": "Error",
+            "confidence": 0.0,
+            "is_deepfake": False,
+            "label": "Unknown",
+            "frames_analyzed": 0,
+            "frame_results": frame_results,
+        }
+
+    # ✅ ✅ ✅ FINAL THREAT-BASED DECISION LOGIC ✅ ✅ ✅
+
+    STRONG_FAKE_THRESHOLD = 0.75   # High confidence fake frame
+    MIN_FAKE_FRAMES = 2            # Minimum strong fake frames
+
+    strong_fake_frames = [
+        fr for fr in frame_results
+        if fr.get("is_deepfake") and fr.get("score", 0) >= STRONG_FAKE_THRESHOLD
+    ]
+
+    if len(strong_fake_frames) >= MIN_FAKE_FRAMES:
+        overall_label = "Fake"
+        overall_is_fake = True
+        overall_conf = float(
+            np.mean([fr["score"] for fr in strong_fake_frames])
+        )
+
+    else:
+        real_frames = [fr for fr in frame_results if fr.get("is_deepfake") is False]
+
+        if len(real_frames) > 0:
+            overall_label = "Real"
+            overall_is_fake = False
+            overall_conf = float(
+                np.mean([fr["score"] for fr in real_frames])
+            )
+        else:
+            overall_label = "Suspicious"
+            overall_is_fake = True
+            overall_conf = float(
+                np.mean([fr.get("score", 0) for fr in frame_results])
+            )
+
+    return {
+        "label": overall_label,
+        "score": overall_conf,
+        "prediction": overall_label,
+        "confidence": overall_conf,
+        "is_deepfake": overall_is_fake,
+        "frames_analyzed": len(valid_frames),
+        "frame_results": frame_results,
+    }
+
 
 
 def create_feature_vector(apk_permissions, apk_features_list):
@@ -1299,7 +1678,7 @@ def get_ai_summary(complaint_data):
     headers = get_openrouter_headers()
 
     data = {
-        "model": "gpt-3.5-turbo",  # Faster model for quick summarization
+        "model": "gpt-3.5-turbo",
         "messages": [{"role": "user", "content": summary_prompt}],
         "max_tokens": 100,
     }
@@ -1320,10 +1699,7 @@ def get_ai_summary(complaint_data):
 
 
 def get_ai_assistance(attack_type, scenario, analysis_results):
-    """Generate AI assistance based on attack type and analysis results.
-    NOTE: This version is tuned to produce a detailed playbook-style answer
-    of at least ~1000 words.
-    """
+    """Generate AI assistance based on attack type and analysis results"""
 
     prompt = ""
 
@@ -1335,54 +1711,24 @@ def get_ai_assistance(attack_type, scenario, analysis_results):
 
         if probability < 0.3:
             prompt = f"""
-The following is a mobile security case. The file submitted, "{app_name}", appears to be safe with a low malware probability of {(probability * 100):.2f}% based on static analysis.
+Based on the analysis, the file you submitted, "{app_name}", appears to be safe with a low malware probability of {(probability * 100):.2f}%.
 
-Write a **comprehensive, positive, and reassuring incident response & prevention playbook** for a non-technical user but with enough depth that a security analyst could also follow it.
-
-Your answer MUST:
-
-- Be structured with clear section headings, for example:
-  1. Situation Overview
-  2. Why This App Seems Safe
-  3. Immediate Safety Checklist
-  4. Ongoing Mobile Security Best Practices
-  5. How to Monitor for Future Issues
-- Use bullet points, numbered steps, and short paragraphs.
-- Explain why the app is considered low risk in simple language.
-- Include proactive advice such as:
-  - Only downloading apps from official stores.
-  - Checking permissions.
-  - Keeping OS and apps updated.
-  - Using reputable mobile security tools.
-- End with a short “Closing Note” reassuring the user that the case can be considered safe, but they should remain vigilant.
-
-VERY IMPORTANT: The response must be **at least 1000 words** and as practical as possible.
+Provide a positive and reassuring message to the user. Explain that the application seems harmless. Then, offer some general, proactive advice for maintaining security, such as:
+- Only download apps from official app stores.
+- Always check app permissions before installation.
+- Keep your device's operating system and apps updated.
+- Use a reliable antivirus program.
+- Mention that they can close the case as the application seems safe.
 """
         else:
             prompt = f"""
-The following is a mobile malware incident. The file submitted, "{app_name}", is considered a security risk with a malware probability of {(probability * 100):.2f}% based on static analysis.
+The file you submitted, "{app_name}", is a security risk with a malware probability of {(probability * 100):.2f}%.
 
-Write a **full incident response and prevention playbook** for this situation.
-
-Your answer MUST:
-
-- Be structured with clear section headings, for example:
-  1. Situation Overview
-  2. Immediate Risk Mitigation Steps
-  3. Malware Removal & Device Cleanup
-  4. Account & Credential Protection
-  5. Evidence Preservation (for legal / HR / law enforcement)
-  6. Long-Term Mobile Security Hardening
-  7. User Awareness & Training Tips
-- Use detailed step-by-step instructions (numbered steps) for actions like:
-  - Uninstalling the app.
-  - Running a security scan.
-  - Checking account logins and sessions.
-  - Enabling 2FA.
-- Explain risks in simple language but with enough technical detail to be useful for an analyst.
-- End with a “Closing Note” that explains when the user can safely consider the case closed.
-
-VERY IMPORTANT: The response must be **at least 1000 words** and very actionable.
+Provide a clear, step-by-step guide on how to:
+1. Immediately mitigate the risk (e.g., uninstall the app, disconnect from the internet).
+2. Safely remove the app and run a security scan.
+3. Protect themselves in the future (e.g., be cautious with third-party APKs, enable two-factor authentication).
+4. Mention the option to close the case once they are comfortable.
 """
 
     # Logic for Phishing analysis (URL or Document)
@@ -1408,129 +1754,67 @@ VERY IMPORTANT: The response must be **at least 1000 words** and very actionable
 
         if has_phishing_url:
             prompt = """
-You are a cyber defence analyst. The analysis of the submitted URL or document has identified one or more **malicious or high-risk phishing links**.
+The analysis of the submitted URL or document has identified one or more **malicious or high-risk phishing links**.
 
-Write a **detailed phishing incident playbook** for the end-user and for a security analyst.
-
-Your answer MUST:
-
-- Be structured with sections such as:
-  1. Situation Overview
-  2. Immediate Actions for the User
-  3. Device & Account Security Checks
-  4. How to Handle Possible Data Theft
-  5. Reporting & Escalation (Bank, Org, CERT, etc.)
-  6. Long-Term Phishing Prevention Strategies
-  7. Awareness Tips & Red Flags for Future Emails/Links
-- Provide very clear, numbered steps for:
-  - Not clicking/visiting the URL.
-  - What to do if they already clicked (password resets, checking recent activity, etc.).
-  - Running device scans.
-  - Notifying their bank / org / platform.
-- Explain how to recognise phishing in the future (domain checks, language cues, urgency tricks, etc.).
-- Use bullets and short paragraphs to make it easy to follow.
-
-VERY IMPORTANT: The response must be **at least 1000 words**, detailed, and practically usable as a real-world playbook.
+Provide a clear, step-by-step guide on how to:
+1. **DO NOT** click on or visit the detected URLs.
+2. If you have already clicked on a link, **immediately change passwords** for any accounts you may have accessed.
+3. **Run a full security scan** on your device immediately.
+4. Explain how to identify phishing links in the future (check the domain name closely, look for generic messages).
+5. Advise on **reporting the phishing attempt** to the relevant authorities or service providers (e.g., Google Safe Browsing, the bank being impersonated).
 """
         else:
             prompt = """
-You are a cyber defence advisor. The analysis of the submitted URL or document did not detect any clear malicious activity. It appears **low-risk / safe**, but the user should still practice caution.
+The analysis of the submitted URL or document did not detect any clear malicious activity. The file/URL appears to be safe, but vigilance is always necessary.
 
-Write a **preventive security playbook** focused on safe browsing and email hygiene.
-
-Your answer MUST:
-
-- Be structured with sections such as:
-  1. Situation Overview
-  2. Why This Case Appears Low-Risk
-  3. Basic Safety Checklist After Receiving Suspicious Links
-  4. Browser & Email Security Best Practices
-  5. Password & Account Protection (Password Managers, 2FA)
-  6. How to Evaluate Future Links & Attachments
-  7. Organisation-Level Controls (for workplaces, if applicable)
-- Include concrete, practical steps a normal user can follow.
-- Include some slightly more advanced tips that a security enthusiast / analyst would appreciate.
-- End with a short “Stay Vigilant” section.
-
-VERY IMPORTANT: The response must be **at least 1000 words**, with plenty of examples and explanations.
+Provide a reassuring message and proactive advice, such as:
+- **Be cautious** with links from unknown sources, even if they pass automated checks.
+- **Verify the authenticity** of documents and their senders (e.g., call the company using a known number).
+- Use **strong, unique passwords** and enable **Two-Factor Authentication (2FA)**.
+- Explain the importance of ongoing vigilance.
 """
 
     # Deepfake logic
-    elif attack_type.startswith("deepfake"):
+    elif attack_type and attack_type.startswith("deepfake"):
         is_deepfake = analysis_results.get("deepfake_image", {}).get(
             "is_deepfake"
         ) or analysis_results.get("deepfake_video", {}).get("is_deepfake")
 
         if is_deepfake:
             prompt = """
-You are a cyber security and misinformation response specialist. The submitted media (image/video) has been flagged as a **Deepfake** with high confidence.
+The submitted media (image/video) has been flagged as a **Deepfake** with high confidence.
 
-Write a **Deepfake incident playbook**.
-
-Your answer MUST:
-
-- Be structured with sections such as:
-  1. Situation Overview
-  2. Immediate Containment (Do Not Share, Take Screenshots, etc.)
-  3. Protecting the Victim (Reputation, Safety, Mental Health Considerations)
-  4. Reporting & Takedown (Social Media Platforms, Legal Options, Police)
-  5. Evidence Preservation for Investigation
-  6. Technical Explanation (High-level) of Deepfakes for the User
-  7. Long-Term Protection Against Future Deepfake Abuse
-- Provide specific, actionable steps on:
-  - How to report content to platforms.
-  - How to talk to HR / Legal / Police.
-  - How to communicate with friends/family/colleagues about the fake media.
-- Use empathetic, supportive language, but keep the structure professional.
-
-VERY IMPORTANT: The response must be **at least 1000 words** and usable as a real-world SOP.
+Provide a clear, urgent guide on how to handle this malicious media:
+1. **DO NOT** share the media further. Sharing it spreads the deception.
+2. **Warn** the original source (the person/organization the media claims to be from) that their identity has been compromised.
+3. **Report** the media to the platform where it was posted (e.g., social media, chat app) for impersonation/misinformation.
+4. Explain that Deepfakes are used for fraud, blackmail, and defamation.
+5. Advise the user to **verify information** using official communication channels only.
 """
         else:
             prompt = """
-You are a cyber security and media literacy expert. The submitted media (image/video) analysis suggests it is **Real** (not a deepfake).
+The submitted media (image/video) analysis suggests it is **Real** (not a deepfake).
 
-Write a **media authenticity awareness playbook**.
-
-Your answer MUST:
-
-- Be structured with sections such as:
-  1. Situation Overview
-  2. What the Analysis Result Means
-  3. Basic Checks Users Can Perform on Photos/Videos
-  4. Tools & Techniques for Verifying Authenticity
-  5. How Deepfakes Typically Look / Behave
-  6. Best Practices Before Sharing Sensitive Media
-  7. Educating Friends, Family, and Teams About Deepfakes
-- Provide examples of good verification habits and simple checklists.
-
-VERY IMPORTANT: The response must be **at least 1000 words**, clear and educational.
+Provide a reassuring message. Offer advice for media authenticity verification in the future, such as:
+- Always be skeptical of unexpected media.
+- Cross-reference the content with trusted news sources.
+- Use reverse image search tools to check for origin.
 """
 
     # Generic prompt for other attack types or if no specific analysis applies
     else:
         prompt = f"""
-You are an experienced cyber security incident responder.
-
-Based on the following cybersecurity incident report, produce a **full incident response and prevention playbook**.
+Based on the following cybersecurity incident report, provide real-time, actionable advice to help the user resolve the issue and prevent future attacks.
 
 Incident Type: {attack_type}
 User Scenario: {scenario}
-Technical Analysis JSON: {json.dumps(analysis_results, indent=2)}
+Technical Analysis: {json.dumps(analysis_results, indent=2)}
 
-Your answer MUST:
-
-- Be clearly structured with headings and subheadings, for example:
-  1. Situation Overview
-  2. Threat Assessment
-  3. Immediate Containment & Mitigation
-  4. Eradication & Recovery Steps
-  5. Post-Incident Hardening (Systems, Accounts, Policies)
-  6. Monitoring & Logging Improvements
-  7. User/Staff Awareness & Training
-- Use numbered lists and bullet points for steps.
-- Be written in simple language but with enough detail for technical readers.
-
-VERY IMPORTANT: The response must be **at least 1000 words** and highly practical.
+The advice should be a clear step-by-step guide on how to:
+1. Immediately mitigate the attack (e.g., disconnect from the internet, change passwords).
+2. Overcome the current problem (e.g., remove malware, report fraud).
+3. Protect themselves in the future.
+4. Mention the option to close the case once they are comfortable.
 """
 
     headers = get_openrouter_headers()
@@ -1538,14 +1822,12 @@ VERY IMPORTANT: The response must be **at least 1000 words** and highly practica
     data = {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
-        # Increased to allow long 1000+ word response
-        "max_tokens": 2800,
-        "temperature": 0.6,
+        "max_tokens": 1500,
     }
 
     try:
         response = requests.post(
-            OPENROUTER_ENDPOINT, headers=headers, json=data, timeout=40
+            OPENROUTER_ENDPOINT, headers=headers, json=data, timeout=20
         )
         print("[AI ASSIST] Status:", response.status_code)
         if response.status_code == 200:
@@ -1774,7 +2056,7 @@ def quick_email_analyser():
 
 
 # -------------------------------------------------------------------
-# SUBMIT CYB COMPLAINT (SAVES TO MONGO + FILES)
+# SUBMIT CYB COMPLAINT (SAVES TO MONGO + FILES) - ENCRYPT + RETURN AI LIKE OLD CODE
 # -------------------------------------------------------------------
 @app.route("/api/submit_complaint", methods=["POST"])
 def submit_complaint():
@@ -1782,9 +2064,10 @@ def submit_complaint():
         return jsonify({"success": False, "error": "Database connection failed."}), 500
 
     try:
-        print("✅ Request received at /api/submit_complaint endpoint.")
+        print("📩 /api/submit_complaint hit")
 
-        user_info = {
+        # User info (plaintext first)
+        user_info_plain = {
             "name": request.form.get("name"),
             "email": request.form.get("email"),
             "phone": request.form.get("phone"),
@@ -1795,181 +2078,346 @@ def submit_complaint():
         scenario = request.form.get("scenario")
         additional_info = request.form.get("additional_info", "")
         complaint_id = generate_complaint_id()
+
         analysis_results = {}
         evidence_files = []
 
-        # 1. Handle file uploads
+        # ---------------- FILE UPLOADS -----------------
         if "evidence" in request.files:
             files = request.files.getlist("evidence")
             temp_dir = tempfile.mkdtemp()
 
             for file in files:
-                if file.filename != "":
+                if file.filename:
                     filename = secure_filename(file.filename)
                     unique_filename = f"{complaint_id}_{filename}"
 
-                    final_path = os.path.join(uploads_abs, unique_filename)
                     temp_path = os.path.join(temp_dir, unique_filename)
-                    file.save(temp_path)
-
-                    # Relative path stored in Mongo (uploads/...)
+                    final_path = os.path.join(uploads_abs, unique_filename)
                     db_path = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
 
-                    evidence_files.append(
-                        {
-                            "filename": filename,
-                            "unique_filename": unique_filename,
-                            "file_path": db_path,
-                        }
-                    )
+                    file.save(temp_path)
+                    print(f"Temp saved: {temp_path}")
 
-                    print(f"File saved temporarily: {temp_path}")
+                    # Store file record
+                    evidence_files.append({
+                        "filename": filename,
+                        "unique_filename": unique_filename,
+                        "file_path": db_path
+                    })
 
-                    # File-type specific analysis
                     low = filename.lower()
-                    if (
-                        attack_type == "phishing"
-                        and low.endswith((".pdf", ".png", ".jpg", ".jpeg"))
-                    ):
-                        analysis_results["phishing_document"] = (
-                            analyze_phishing_document(temp_path, filename)
+
+                    # PHISHING ANALYSIS
+                    if attack_type == "phishing" and low.endswith((".pdf", ".png", ".jpg", ".jpeg")):
+                        analysis_results["phishing_document"] = analyze_phishing_document(
+                            temp_path,
+                            filename
                         )
-                    elif (
-                        attack_type == "deepfake_image"
-                        and low.endswith((".png", ".jpg", ".jpeg"))
-                    ):
-                        analysis_results["deepfake_image"] = analyze_deepfake_image(
-                            temp_path
-                        )
-                    elif attack_type == "deepfake_video" and low.endswith(
-                        (".mp4", ".avi", ".mov", ".mkv")
-                    ):
-                        analysis_results["deepfake_video"] = analyze_deepfake_video(
-                            temp_path
-                        )
+
+                    # IMAGE DEEPFAKE
+                    elif attack_type == "deepfake_image" and low.endswith((".png", ".jpg", ".jpeg")):
+                        # now returns flat dict {prediction, confidence, is_deepfake, ...}
+                        analysis_results["deepfake_image"] = analyze_deepfake_image(temp_path)
+
+                    # VIDEO DEEPFAKE
+                    elif attack_type == "deepfake_video" and low.endswith((".mp4", ".avi", ".mov", ".mkv")):
+                         analysis_results["deepfake_video"] = analyze_deepfake_video(temp_path)
+
+
+                    # APK MALWARE
                     elif attack_type == "malware" and low.endswith(".apk"):
                         analysis_results["apk_analysis"] = analyze_apk(temp_path)
 
-                    # Move file from temp to final upload folder
-                    try:
-                        shutil.move(temp_path, final_path)
-                        print(f"Moved file to final path: {final_path}")
-                    except Exception as move_err:
-                        print(
-                            f"Error moving file from {temp_path} to {final_path}: {move_err}"
-                        )
-                        raise
+                    # Move file permanently
+                    shutil.move(temp_path, final_path)
+                    print(f"Moved → {final_path}")
 
+            # Remove temp directory
             try:
                 os.rmdir(temp_dir)
-            except OSError as e:
-                print(f"Warning: Could not remove temporary directory {temp_dir}: {e}")
+            except Exception:
+                pass
 
-        # 2. URL-specific analysis
+        # ---------------- URL ANALYSIS -----------------
         if attack_type == "phishing" and request.form.get("url"):
             analysis_results["url_analysis"] = analyze_url(request.form.get("url"))
 
-        print(f"Final Analysis Results: {analysis_results}")
+        print("Analysis Done:", analysis_results)
 
-        # 3. Risk + AI assistance
+        # ---------------- ENCRYPT USER INFO -----------------
+        user_info_encrypted = {}
+        for k, v in user_info_plain.items():
+            user_info_encrypted[k] = rsa_encrypt_text(v) if v else None
+
+        # ---------------- COMPUTE RISK + AI -----------------
         risk_level = determine_risk_level(analysis_results)
-        ai_assistance_plain = get_ai_assistance(attack_type, scenario, analysis_results)
+        ai_assistance = get_ai_assistance(attack_type, scenario, analysis_results)
+        ai_summary = get_ai_summary({
+            "attack_type": attack_type,
+            "risk_level": risk_level,
+            "scenario": scenario
+        })
 
-        # 4. Prepare Mongo document
+        # ---------------- ENCRYPT SENSITIVE FIELDS -----------------
+        sensitive_encrypted = {
+            "attack_type": rsa_encrypt_text(attack_type) if attack_type else None,
+            "analysis_results": rsa_encrypt_text(json.dumps(analysis_results)) if analysis_results else None,
+            "ai_assistance": rsa_encrypt_text(ai_assistance) if ai_assistance else None,
+            "ai_summary": rsa_encrypt_text(ai_summary) if ai_summary else None,
+            "risk_level": rsa_encrypt_text(risk_level) if risk_level else None,
+        }
+
+        # ---------------- MONGO DOCUMENT -----------------
         complaint_data = {
             "complaint_id": complaint_id,
-            "user_info": user_info,
-            "attack_type": attack_type,
-            "scenario": scenario,
-            "additional_info": additional_info,
-            "evidence_files": evidence_files,
-            "analysis_results": analysis_results,
-            # STORE ENCRYPTED AI TEXT
-            "ai_assistance": encrypt_text(ai_assistance_plain),
-            "risk_level": risk_level,
-            "status": "pending",
-            "created_at": datetime.utcnow(),
-            "last_updated": datetime.utcnow(),
-        }
+            "user_info_encrypted": user_info_encrypted,
+            "scenario_encrypted": rsa_encrypt_text(scenario) if scenario else None,
+            "additional_info_encrypted": rsa_encrypt_text(additional_info) if additional_info else None,
+            "sensitive_encrypted": sensitive_encrypted,
 
-        # Short summary used by admin + team dashboards
-        summary_input = {
+            # NON-sensitive plaintext
             "attack_type": attack_type,
             "risk_level": risk_level,
-            "scenario": scenario,
+            "ai_summary": ai_summary,
+
+            "evidence_files": evidence_files,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc),
+            "last_updated": datetime.now(timezone.utc),
         }
-        ai_summary_plain = get_ai_summary(summary_input)
-        complaint_data["ai_summary"] = encrypt_text(ai_summary_plain)
 
         result = complaints_collection.insert_one(complaint_data)
-        print(
-            f"✅ Complaint {complaint_id} saved successfully to MongoDB ID: {result.inserted_id}"
-        )
+        print(f"📌 Saved complaint ID {complaint_id}")
 
-        # Send PLAINTEXT AI assistance back to frontend for user view
-        return jsonify(
-            {
-                "success": True,
-                "complaint_id": complaint_id,
-                "ai_assistance": ai_assistance_plain,
-                "risk_level": risk_level,
-                "analysis_results": analysis_results,
-            }
-        )
+        return jsonify({
+            "success": True,
+            "complaint_id": complaint_id,
+            "risk_level": risk_level,
+            "ai_assistance": ai_assistance,
+            "analysis_results": analysis_results,
+        })
 
     except Exception as e:
-        print(f"❌ Error during complaint submission: {e}")
+        print("❌ ERROR:", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# -------------------------------------------------------------------
+# Admin decrypt endpoints (user info + sensitive)
+# -------------------------------------------------------------------
+@app.route("/api/admin/decrypt-user-info/<complaint_id>", methods=["GET"])
+def admin_decrypt_user_info(complaint_id):
+    """
+    Admin-only endpoint that returns decrypted user_info for a complaint.
+    The complaint stores only ciphertext in 'user_info_encrypted' map.
+    """
+    admin = get_admin_from_request()
+    if not admin:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    if complaints_collection is None:
+        return jsonify({"success": False, "error": "Database connection failed."}), 500
+
+    try:
+        complaint = complaints_collection.find_one({"complaint_id": complaint_id})
+        if not complaint:
+            return jsonify({"success": False, "error": "Complaint not found"}), 404
+
+        encrypted_map = complaint.get("user_info_encrypted")
+        if not encrypted_map:
+            return jsonify({"success": False, "error": "No encrypted user info found"}), 404
+
+        decrypted = {}
+        try:
+            for k, v in encrypted_map.items():
+                decrypted[k] = rsa_decrypt_text(v) if v else None
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Decryption failed: {str(e)}"}), 500
+
+        return jsonify({"success": True, "user_info": decrypted})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/admin/decrypt-sensitive/<complaint_id>", methods=["GET"])
+def admin_decrypt_sensitive(complaint_id):
+    """
+    Admin-only endpoint to decrypt the 'sensitive_encrypted' map that contains:
+    - attack_type
+    - analysis_results (JSON)
+    - ai_assistance
+    - ai_summary
+    - risk_level
+    """
+    admin = get_admin_from_request()
+    if not admin:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    if complaints_collection is None:
+        return jsonify({"success": False, "error": "Database connection failed."}), 500
+
+    try:
+        complaint = complaints_collection.find_one({"complaint_id": complaint_id})
+        if not complaint:
+            return jsonify({"success": False, "error": "Complaint not found"}), 404
+
+        enc = complaint.get("sensitive_encrypted")
+        if not enc:
+            return jsonify({"success": False, "error": "No sensitive_encrypted found"}), 404
+
+        decrypted = {}
+        try:
+            # attack_type
+            decrypted["attack_type"] = rsa_decrypt_text(enc.get("attack_type")) if enc.get("attack_type") else None
+            # analysis_results (stored as JSON string before encryption)
+            ar_enc = enc.get("analysis_results")
+            if ar_enc:
+                ar_plain = rsa_decrypt_text(ar_enc)
+                try:
+                    decrypted["analysis_results"] = json.loads(ar_plain)
+                except Exception:
+                    decrypted["analysis_results"] = ar_plain
+            else:
+                decrypted["analysis_results"] = None
+
+            decrypted["ai_assistance"] = rsa_decrypt_text(enc.get("ai_assistance")) if enc.get("ai_assistance") else None
+            decrypted["ai_summary"] = rsa_decrypt_text(enc.get("ai_summary")) if enc.get("ai_summary") else None
+            decrypted["risk_level"] = rsa_decrypt_text(enc.get("risk_level")) if enc.get("risk_level") else None
+
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Decryption failed: {str(e)}"}), 500
+
+        return jsonify({"success": True, "sensitive": decrypted})
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
 # -------------------------------------------------------------------
-# GET SINGLE COMPLAINT (ADMIN VIEW)
+# GET SINGLE COMPLAINT (ADMIN / TEAM VIEW) - NOW RETURNS DECRYPTED FIELDS
 # -------------------------------------------------------------------
 @app.route("/api/get_complaint/<complaint_id>")
 def get_complaint(complaint_id):
+    """
+    Returns a single complaint with decrypted fields so Admin and Team
+    can directly show readable values in the UI.
+
+    Decrypted in response:
+    - user_info (name, email, phone, address)
+    - scenario
+    - additional_info
+    - analysis_results (dict)
+    - ai_assistance
+    - risk_level, attack_type (fallback to decrypted if plaintext missing)
+    """
     if complaints_collection is None:
         return jsonify({"success": False, "error": "Database connection failed."}), 500
 
     try:
         complaint = complaints_collection.find_one({"complaint_id": complaint_id})
 
-        if complaint:
-            complaint["_id"] = str(complaint["_id"])
-            for date_field in ["submitted_at", "created_at", "last_updated"]:
-                if date_field in complaint and complaint[date_field]:
-                    if isinstance(complaint[date_field], datetime):
-                        complaint[date_field] = complaint[date_field].isoformat()
+        if not complaint:
+            return jsonify({"success": False, "error": "Complaint not found"}), 404
 
-            daily_updates = complaint.get("daily_updates", [])
-            completion_report = complaint.get("completion_report")
+        # Convert _id and date fields for JSON
+        complaint["_id"] = str(complaint["_id"])
+        for date_field in ["submitted_at", "created_at", "last_updated"]:
+            if date_field in complaint and complaint[date_field]:
+                if isinstance(complaint[date_field], datetime):
+                    complaint[date_field] = complaint[date_field].isoformat()
 
-            response = {
-                "mongo_id": complaint["_id"],
-                "complaint_id": complaint.get("complaint_id"),
-                "status": complaint.get("status", "pending"),
-                "category": complaint.get("category"),
-                "risk_level": complaint.get("risk_level"),
-                "attack_type": complaint.get("attack_type"),
-                "scenario": complaint.get("scenario"),
-                "additional_info": complaint.get("additionalInfo")
-                or complaint.get("additional_info"),
-                "daily_updates": daily_updates,
-                "completion_report": completion_report,
-                "user_info": complaint.get("user_info", {}),
-                "evidence_files": complaint.get("evidence_files", []),
-                "analysis_results": complaint.get("analysis_results", {}),
-                # DECRYPT before returning
-                "ai_assistance": decrypt_text(complaint.get("ai_assistance", "")),
-                "ai_summary": decrypt_text(complaint.get("ai_summary", "")),
-                "submitted_at": complaint.get("submitted_at"),
-                "created_at": complaint.get("created_at"),
-                "last_updated": complaint.get("last_updated"),
+        # --- Decrypt user_info_encrypted ---
+        decrypted_user_info = {}
+        try:
+            encrypted_user_info = complaint.get("user_info_encrypted") or {}
+            for k, v in encrypted_user_info.items():
+                decrypted_user_info[k] = rsa_decrypt_text(v) if v else None
+        except Exception as e:
+            decrypted_user_info = {
+                "error": f"User info decryption failed: {str(e)}"
             }
 
-            return jsonify({"success": True, "complaint": response})
+        # --- Decrypt scenario & additional_info ---
+        try:
+            scenario_plain = rsa_decrypt_text(complaint.get("scenario_encrypted")) if complaint.get("scenario_encrypted") else None
+        except Exception as e:
+            scenario_plain = f"[Decryption error: {e}]"
 
-        else:
-            return jsonify({"success": False, "error": "Complaint not found"}), 404
+        try:
+            additional_plain = rsa_decrypt_text(complaint.get("additional_info_encrypted")) if complaint.get("additional_info_encrypted") else None
+        except Exception as e:
+            additional_plain = f"[Decryption error: {e}]"
+
+        # --- Decrypt sensitive_encrypted map ---
+        decrypted_sensitive = {
+            "attack_type": None,
+            "risk_level": None,
+            "ai_assistance": None,
+            "ai_summary_dec": None,
+            "analysis_results": None,
+        }
+        enc_map = complaint.get("sensitive_encrypted") or {}
+
+        try:
+            # attack_type & risk_level
+            if enc_map.get("attack_type"):
+                decrypted_sensitive["attack_type"] = rsa_decrypt_text(enc_map["attack_type"])
+            if enc_map.get("risk_level"):
+                decrypted_sensitive["risk_level"] = rsa_decrypt_text(enc_map["risk_level"])
+
+            # ai_assistance
+            if enc_map.get("ai_assistance"):
+                decrypted_sensitive["ai_assistance"] = rsa_decrypt_text(enc_map["ai_assistance"])
+
+            # ai_summary (decrypted copy, though plaintext also stored)
+            if enc_map.get("ai_summary"):
+                decrypted_sensitive["ai_summary_dec"] = rsa_decrypt_text(enc_map["ai_summary"])
+
+            # analysis_results (JSON string -> dict)
+            if enc_map.get("analysis_results"):
+                ar_plain = rsa_decrypt_text(enc_map["analysis_results"])
+                try:
+                    decrypted_sensitive["analysis_results"] = json.loads(ar_plain)
+                except Exception:
+                    decrypted_sensitive["analysis_results"] = ar_plain
+        except Exception as e:
+            decrypted_sensitive["error"] = f"Sensitive decryption failed: {str(e)}"
+
+        # Prefer plaintext attack_type/risk_level from DB if present;
+        # fall back to decrypted_sensitive if not.
+        attack_type_plain = complaint.get("attack_type") or decrypted_sensitive.get("attack_type")
+        risk_level_plain = complaint.get("risk_level") or decrypted_sensitive.get("risk_level")
+        ai_summary_plain = complaint.get("ai_summary") or decrypted_sensitive.get("ai_summary_dec")
+
+        response = {
+            "mongo_id": complaint["_id"],
+            "complaint_id": complaint.get("complaint_id"),
+            "status": complaint.get("status", "pending"),
+            "attack_type": attack_type_plain,
+            "risk_level": risk_level_plain,
+            "ai_summary": ai_summary_plain,
+            # DECRYPTED FIELDS FOR ADMIN / TEAM UI
+            "user_info": decrypted_user_info,
+            "scenario": scenario_plain,
+            "additional_info": additional_plain,
+            "analysis_results": decrypted_sensitive.get("analysis_results"),
+            "ai_assistance": decrypted_sensitive.get("ai_assistance"),
+            # Evidence & workflow
+            "evidence_files": complaint.get("evidence_files", []),
+            "daily_updates": complaint.get("daily_updates", []),
+            "completion_report": complaint.get("completion_report"),
+            "assigned_team": complaint.get("assigned_team"),
+            # Dates
+            "submitted_at": complaint.get("submitted_at"),
+            "created_at": complaint.get("created_at"),
+            "last_updated": complaint.get("last_updated"),
+            # (Optional) still return encrypted blobs if you want to debug
+            "user_info_encrypted": complaint.get("user_info_encrypted", {}),
+            "scenario_encrypted": complaint.get("scenario_encrypted"),
+            "additional_info_encrypted": complaint.get("additional_info_encrypted"),
+            "sensitive_encrypted": complaint.get("sensitive_encrypted", {}),
+        }
+
+        return jsonify({"success": True, "complaint": response})
 
     except Exception as e:
         print(f"❌ Error retrieving complaint from MongoDB: {e}")
@@ -1977,20 +2425,22 @@ def get_complaint(complaint_id):
 
 
 # -------------------------------------------------------------------
-# GET ALL COMPLAINTS (ADMIN DASHBOARD SUMMARY)
+# GET ALL COMPLAINTS (ADMIN DASHBOARD SUMMARY) - returns non-sensitive overview
 # -------------------------------------------------------------------
 @app.route("/api/admin/complaints")
 def get_all_complaints():
     if complaints_collection is None:
         return jsonify({"success": False, "error": "Database connection failed."}), 500
     try:
+        # We include attack_type, risk_level, ai_summary (plaintext, non-personal)
         projection = {
             "_id": 0,
-            "analysis_results": 0,
-            "ai_assistance": 0,
-            "ai_summary": 0,
-            "admin_notes": 0,
+            "user_info_encrypted": 0,
+            "sensitive_encrypted": 0,
+            "scenario_encrypted": 0,
+            "additional_info_encrypted": 0,
             "evidence_files": 0,
+            "admin_notes": 0,
         }
 
         complaints_cursor = complaints_collection.find({}, projection).sort(
@@ -2073,23 +2523,40 @@ def get_ai_guidance():
 
         context = ""
         if complaint_id and complaints_collection is not None:
+            # Try to read decrypted sensitive analysis if available.
             complaint = complaints_collection.find_one(
                 {"complaint_id": complaint_id},
                 {
-                    "scenario": 1,
-                    "analysis_results": 1,
-                    "risk_level": 1,
+                    "scenario_encrypted": 1,
+                    "sensitive_encrypted": 1,
                     "attack_type": 1,
+                    "risk_level": 1,
                     "_id": 0,
                 },
             )
             if complaint:
+                try:
+                    scenario_plain = rsa_decrypt_text(complaint.get("scenario_encrypted")) if complaint.get("scenario_encrypted") else ""
+                except Exception:
+                    scenario_plain = ""
+                analysis_plain = ""
+                try:
+                    analysis_enc = complaint.get("sensitive_encrypted", {}).get("analysis_results")
+                    if analysis_enc:
+                        ar_plain = rsa_decrypt_text(analysis_enc)
+                        try:
+                            analysis_plain = json.dumps(json.loads(ar_plain), indent=2)
+                        except Exception:
+                            analysis_plain = ar_plain
+                except Exception:
+                    analysis_plain = ""
+
                 context = f"""
 Case ID: {complaint_id}
-Attack Type: {complaint.get('attack_type')}
+Attack Type: {complaint.get('attack_type') or attack_type}
 Risk Level: {complaint.get('risk_level')}
-Scenario: {complaint.get('scenario')}
-Analysis Results: {json.dumps(complaint.get('analysis_results', {}), indent=2)}
+Scenario: {scenario_plain}
+Analysis Results: {analysis_plain}
 """
 
         prompt = f"""
@@ -2143,7 +2610,7 @@ Requirements:
 
 
 # -------------------------------------------------------------------
-# OTP SYSTEM (TWILIO)
+# OTP SYSTEM (TWILIO) – FOR CITIZEN LOGIN & WOMEN COMPLAINT
 # -------------------------------------------------------------------
 otp_storage = {}  # phone: otp
 otp_verified = {}  # phone: True if verified
@@ -2241,6 +2708,124 @@ def verify_otp():
     except Exception as e:
         print("Error verifying OTP:", e)
         return jsonify({"verified": False, "message": str(e)}), 500
+
+user_otp_storage = {}
+
+
+# -------------------------
+# SEND OTP (CITIZEN)
+# -------------------------
+@app.route("/send-user-otp", methods=["POST"])
+def send_user_otp():
+    try:
+        data = request.get_json()
+        phone = data.get("phone")
+
+        if not phone:
+            return jsonify({"status": "error", "message": "Phone number required"}), 400
+
+        phone = phone.strip()
+        if not phone.startswith("+"):
+            phone = "+91" + phone
+
+        otp = generate_otp()
+        user_otp_storage[phone] = otp
+        print(f"[USER OTP GENERATED] {phone} → {otp}")
+
+        # send SMS via 2Factor
+        send_otp_via_2factor_sms(phone, otp)
+
+        return jsonify({"status": "success", "message": "User OTP sent successfully"})
+
+    except Exception as e:
+        print("Error sending User OTP:", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# -----------------------------
+# VERIFY OTP (CITIZEN LOGIN)
+# -----------------------------
+@app.route("/verify-user-otp", methods=["POST"])
+def verify_user_otp():
+    try:
+        data = request.get_json()
+        phone = data.get("phone")
+        otp = data.get("otp")
+
+        if not phone or not otp:
+            return jsonify({"verified": False, "message": "Phone and OTP required"}), 400
+
+        phone = phone.strip()
+        if not phone.startswith("+"):
+            phone = "+91" + phone
+
+        stored_otp = user_otp_storage.get(phone)
+        if stored_otp == otp:
+            otp_verified[phone] = True
+            user_otp_storage.pop(phone, None)
+            print(f"[USER OTP VERIFIED] {phone}")
+            return jsonify({"verified": True})
+
+        return jsonify({"verified": False, "message": "Invalid OTP"}), 400
+
+    except Exception as e:
+        print("Error verifying User OTP:", e)
+        return jsonify({"verified": False, "message": str(e)}), 500
+
+
+
+# Save basic citizen user (used by React CitizenLogin.jsx)
+@app.route("/save-user", methods=["POST"])
+def save_user():
+    global users_collection
+
+    if users_collection is None:
+        return jsonify({"success": False, "message": "DB error"}), 500
+
+    try:
+        data = request.get_json()
+        name = data.get("name")
+        phone = data.get("phone")
+
+        if not name or not phone:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "message": "Name and phone are required",
+                    }
+                ),
+                400,
+            )
+
+        if not phone.startswith("+"):
+            phone = "+91" + phone.strip()
+
+        # Upsert user (create or update)
+        users_collection.update_one(
+            {"phone": phone},
+            {
+                "$set": {
+                    "name": name,
+                    "phone": phone,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.utcnow(),
+                },
+            },
+            upsert=True,
+        )
+
+        return jsonify(
+            {
+                "success": True,
+                "message": "User saved successfully",
+            }
+        )
+    except Exception as e:
+        print("Error saving user:", e)
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 # -------------------------------------------------------------------
@@ -2604,9 +3189,9 @@ def get_assigned_complaints(team):
     Used by TeamDashboard.jsx
 
     Returns complaints with:
-    - complaint_id, attack_type, category, risk_level, ai_summary
-    - scenario, additional_info, user_info, analysis_results
+    - complaint_id, attack_type, risk_level, ai_summary
     - assigned_team, status, created_at, last_updated, evidence_files, etc.
+    (Sensitive fields are still stored encrypted in DB.)
     """
     try:
         complaints = list(
@@ -2623,11 +3208,6 @@ def get_assigned_complaints(team):
             for df in ["created_at", "last_updated", "submitted_at"]:
                 if df in c and isinstance(c[df], datetime):
                     c[df] = c[df].isoformat()
-            # Decrypt AI fields if present
-            if "ai_assistance" in c:
-                c["ai_assistance"] = decrypt_text(c["ai_assistance"])
-            if "ai_summary" in c:
-                c["ai_summary"] = decrypt_text(c["ai_summary"])
 
         return jsonify(complaints)
     except Exception as e:
@@ -2764,104 +3344,27 @@ def team_stats():
         return jsonify({"stats": {}}), 500
 
 
-user_otp_storage = {}
-
-
-# -------------------------
-# SEND OTP (CITIZEN)
-# -------------------------
-@app.route("/send-user-otp", methods=["POST"])
-def send_user_otp():
-    try:
-        data = request.get_json()
-        phone = data.get("phone")
-
-        if not phone:
-            return jsonify({"status": "error", "message": "Phone number required"}), 400
-
-        phone = phone.strip()
-        if not phone.startswith("+"):
-            phone = "+91" + phone
-
-        otp = generate_otp()
-        user_otp_storage[phone] = otp
-        print(f"[USER OTP GENERATED] {phone} → {otp}")
-
-        # send SMS via 2Factor
-        send_otp_via_2factor_sms(phone, otp)
-
-        return jsonify({"status": "success", "message": "User OTP sent successfully"})
-
-    except Exception as e:
-        print("Error sending User OTP:", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# -----------------------------
-# VERIFY OTP (CITIZEN LOGIN)
-# -----------------------------
-@app.route("/verify-user-otp", methods=["POST"])
-def verify_user_otp():
-    try:
-        data = request.get_json()
-        phone = data.get("phone")
-        otp = data.get("otp")
-
-        if not phone or not otp:
-            return jsonify({"verified": False, "message": "Phone and OTP required"}), 400
-
-        phone = phone.strip()
-        if not phone.startswith("+"):
-            phone = "+91" + phone
-
-        stored_otp = user_otp_storage.get(phone)
-        if stored_otp == otp:
-            otp_verified[phone] = True
-            user_otp_storage.pop(phone, None)
-            print(f"[USER OTP VERIFIED] {phone}")
-            return jsonify({"verified": True})
-
-        return jsonify({"verified": False, "message": "Invalid OTP"}), 400
-
-    except Exception as e:
-        print("Error verifying User OTP:", e)
-        return jsonify({"verified": False, "message": str(e)}), 500
-
-
-# -----------------------------
-# SAVE USER (AFTER OTP VERIFIED)
-# -----------------------------
-@app.route("/save-user", methods=["POST"])
-def save_user():
-    try:
-        data = request.json
-
-        if not data.get("name") or not data.get("phone"):
-            return jsonify({"success": False, "message": "Missing fields"}), 400
-
-        existing = user_collection.find_one({"phone": data["phone"]})
-
-        if existing:
-            return jsonify({"success": True, "message": "User already exists. Login successful!"})
-        entry = {
-            "name": data["name"],
-            "phone": data["phone"],
-            "created_at": datetime.utcnow()
-        }
-
-        user_collection.insert_one(entry)
-        return jsonify({"success": True, "message": "User saved successfully!"})
-    except Exception as e:
-        print("Error:", e)
-        return jsonify({"success": False, "message": "Server error"}), 500
-
+# -------------------------------------------------------------------
+# RUN SERVER
+# -------------------------------------------------------------------
 # -------------------------------------------------------------------
 # RUN SERVER
 # -------------------------------------------------------------------
 if __name__ == "__main__":
+    """
+    Local development entrypoint.
+
+    On Render you typically DO NOT run this block.
+    Instead, use a Start Command like:
+      gunicorn advanced_cyber_backend:app --bind 0.0.0.0:$PORT
+    """
+    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
+    port = int(os.environ.get("PORT", 5006))
+
     print("=" * 80)
-    print("      ADVANCED CYBERSECURITY ANALYSIS PLATFORM")
+    print("      ADVANCED CYBERSECURITY ANALYSIS PLATFORM (with RSA+AES hybrid encryption)")
     print("=" * 80)
-    print("\n🚀 Starting Flask server on http://0.0.0.0:5006")
+    print(f"\n🚀 Starting Flask server on http://0.0.0.0:{port}  (debug={debug_mode})")
     print("=" * 80 + "\n")
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5006)))
+
+    app.run(debug=debug_mode, host="0.0.0.0", port=port)
